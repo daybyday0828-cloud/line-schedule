@@ -102,10 +102,12 @@
 
   const LABELS = { o: '○', t: '△', x: '×' };
   const $ = id => document.getElementById(id);
+  const SAVE_DELAY_MS = 600;  // 最後に押してからこの時間が経ったら、まとめて保存する
   let idToken = null;
-  let state = null;          // { name, survey, answers }
-  let queue = Promise.resolve();
-  let pending = 0;
+  let state = null;           // { name, survey, answers }
+  let unsaved = {};           // まだ送っていない変更 { 'yyyy-MM-dd': 'o' | 't' | 'x' }
+  let saveTimer = null;
+  let saving = null;          // 送信中の Promise
 
   async function api(action, extra) {
     // Content-Type を付けない（text/plain）ことで、CORS のプリフライトを発生させない
@@ -133,9 +135,13 @@
     toast.timer = setTimeout(() => t.classList.remove('show'), 4000);
   }
 
+  function hasPending() {
+    return saving !== null || saveTimer !== null || Object.keys(unsaved).length > 0;
+  }
+
   function setStatus() {
     const s = $('status');
-    if (pending > 0) { s.textContent = '保存中…'; s.className = 'saving'; }
+    if (hasPending()) { s.textContent = '保存中…'; s.className = 'saving'; }
     else if (setStatus.touched) { s.textContent = '✓ 保存済み'; s.className = 'saved'; }
     else { s.textContent = ''; s.className = ''; }
   }
@@ -166,17 +172,30 @@
     state.answers[date] = value;
     paintRow(row, date);           // 押した瞬間に色を変える
     updateMeta();
-    pending++;
+    unsaved[date] = value;
     setStatus.touched = true;
+    // 続けて押している間は待ち、手が止まったらまとめて1回で保存する
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { saveTimer = null; flush(); }, SAVE_DELAY_MS);
     setStatus();
-    // 保存は順番に1件ずつ送る（連打しても最後の選択が残るように）
-    queue = queue
-      .then(() => api('vote', { surveyId: state.survey.id, date: date, value: value }))
+  }
+
+  /** 未送信の変更をまとめて送る。すべて保存し終わると解決する Promise を返す */
+  async function flush() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    while (saving) await saving;   // 送信中なら終わるのを待つ（順番を守る）
+    const changes = unsaved;
+    if (Object.keys(changes).length === 0) { setStatus(); return; }
+    unsaved = {};
+    setStatus();
+    saving = api('saveMany', { surveyId: state.survey.id, answers: changes })
       .catch(async err => {
         toast('保存できませんでした：' + err.message);
-        try { state.answers = (await api('get')).answers || {}; render(); } catch (e) { /* 表示はそのまま */ }
+        try { state.answers = (await api('get')).answers || {}; unsaved = {}; render(); } catch (e) { /* 表示はそのまま */ }
       })
-      .finally(() => { pending--; setStatus(); });
+      .finally(() => { saving = null; setStatus(); });
+    await saving;
+    if (Object.keys(unsaved).length && !saveTimer) await flush(); // 送信中に押された分
   }
 
   function render() {
@@ -226,7 +245,7 @@
       tallyBtn.disabled = true;
       tallyBtn.textContent = '読み込み中…';
       try {
-        await queue; // 保存待ちがあれば先に済ませる
+        await flush(); // 保存待ちがあれば先に済ませる
         const data = await api('tally');
         tallyBox.textContent = '';
         tallyBox.appendChild(el('pre', { textContent: data.text }));
@@ -240,7 +259,7 @@
 
     const closeBtn = el('button', { className: 'btn primary', type: 'button', textContent: '閉じる' });
     closeBtn.addEventListener('click', async () => {
-      if (pending > 0) { toast('保存が終わるまでお待ちください…'); await queue; }
+      if (hasPending()) { toast('保存しています…'); await flush(); }
       if (liff.isInClient()) liff.closeWindow(); else window.close();
     });
 
@@ -257,7 +276,7 @@
       }
       delBtn.disabled = true;
       try {
-        await queue;
+        await flush();
         const data = await api('deleteMine');
         state = await api('get');
         render();
